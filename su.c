@@ -59,14 +59,14 @@ static int from_init(struct su_initiator *from)
     snprintf(path, sizeof(path), "/proc/%u/cmdline", from->pid);
     fd = open(path, O_RDONLY);
     if (fd < 0) {
-        ALOGE("Opening command line");
+        PLOGE("Opening command line");
         return -1;
     }
     len = read(fd, args, sizeof(args));
     err = errno;
     close(fd);
     if (len < 0 || len == sizeof(args)) {
-        ALOGE("Reading command line", err);
+        PLOGEV("Reading command line", err);
         return -1;
     }
 
@@ -94,7 +94,7 @@ static int from_init(struct su_initiator *from)
     snprintf(path, sizeof(path), "/proc/%u/exe", from->pid);
     len = readlink(path, exe, sizeof(exe));
     if (len < 0) {
-        ALOGE("Getting exe path");
+        PLOGE("Getting exe path");
         return -1;
     }
     exe[len] = '\0';
@@ -149,7 +149,7 @@ static int socket_create_temp(char *path, size_t len)
 
     fd = socket(AF_LOCAL, SOCK_STREAM, 0);
     if (fd < 0) {
-        ALOGE("socket");
+        PLOGE("socket");
         return -1;
     }
 
@@ -166,12 +166,12 @@ static int socket_create_temp(char *path, size_t len)
     unlink(sun.sun_path);
 
     if (bind(fd, (struct sockaddr*)&sun, sizeof(sun)) < 0) {
-        ALOGE("bind");
+        PLOGE("bind");
         goto err;
     }
 
     if (listen(fd, 1) < 0) {
-        ALOGE("listen");
+        PLOGE("listen");
         goto err;
     }
 
@@ -193,13 +193,13 @@ static int socket_accept(int serv_fd)
     FD_ZERO(&fds);
     FD_SET(serv_fd, &fds);
     if (select(serv_fd + 1, &fds, NULL, NULL, &tv) < 1) {
-        ALOGE("select");
+        PLOGE("select");
         return -1;
     }
 
     fd = accept(serv_fd, NULL, NULL);
     if (fd < 0) {
-        ALOGE("accept");
+        PLOGE("accept");
         return -1;
     }
 
@@ -218,7 +218,7 @@ do {							\
 	size_t __count = sizeof(__data);		\
 	size_t __len = write((fd), &__data, __count);	\
 	if (__len != __count) {				\
-		ALOGE("write(" #data ")");		\
+		PLOGE("write(" #data ")");		\
 		return -1;				\
 	}						\
 } while (0)
@@ -232,7 +232,7 @@ do {							\
     write_token(fd, bin_size);
     len = write(fd, ctx->from.bin, bin_size);
     if (len != bin_size) {
-        ALOGE("write(bin)");
+        PLOGE("write(bin)");
         return -1;
     }
     cmd = get_command(&ctx->to);
@@ -240,7 +240,7 @@ do {							\
     write_token(fd, cmd_size);
     len = write(fd, cmd, cmd_size);
     if (len != cmd_size) {
-        ALOGE("write(cmd)");
+        PLOGE("write(cmd)");
         return -1;
     }
     return 0;
@@ -252,7 +252,7 @@ static int socket_receive_result(int fd, char *result, ssize_t result_len)
     
     len = read(fd, result, result_len-1);
     if (len < 0) {
-        ALOGE("read(result)");
+        PLOGE("read(result)");
         return -1;
     }
     result[len] = '\0';
@@ -283,7 +283,10 @@ static void deny(const struct su_context *ctx)
 {
     char *cmd = get_command(&ctx->to);
 
-    send_intent(ctx, "", 0, ACTION_RESULT);
+    // No send to UI the deny request for shell and root users (is in the log)
+    if( ctx->from.uid != AID_SHELL && ctx->from.uid != AID_ROOT ) {
+        send_intent(ctx, "", 0, ACTION_RESULT);
+    }
     ALOGW("request rejected (%u->%u %s)", ctx->from.uid, ctx->to.uid, cmd);
     fprintf(stderr, "%s\n", strerror(EACCES));
     exit(EXIT_FAILURE);
@@ -295,7 +298,10 @@ static void allow(const struct su_context *ctx)
     int argc, err;
 
     umask(ctx->umask);
-    send_intent(ctx, "", 1, ACTION_RESULT);
+    // No send to UI the allow request for shell and root users (is in the log)
+    if( ctx->from.uid != AID_SHELL && ctx->from.uid != AID_ROOT ) {
+        send_intent(ctx, "", 1, ACTION_RESULT);
+    }
 
     arg0 = strrchr (ctx->to.shell, '/');
     arg0 = (arg0) ? arg0 + 1 : ctx->to.shell;
@@ -316,18 +322,18 @@ static void allow(const struct su_context *ctx)
      * if ctx->to.uid isn't root.
      */
     if (seteuid(0)) {
-        ALOGE("seteuid (root)");
+        PLOGE("seteuid (root)");
         exit(EXIT_FAILURE);
     }
 
     populate_environment(ctx);
 
     if (setresgid(ctx->to.uid, ctx->to.uid, ctx->to.uid)) {
-        ALOGE("setresgid (%u)", ctx->to.uid);
+        PLOGE("setresgid (%u)", ctx->to.uid);
         exit(EXIT_FAILURE);
     }
     if (setresuid(ctx->to.uid, ctx->to.uid, ctx->to.uid)) {
-        ALOGE("setresuid (%u)", ctx->to.uid);
+        PLOGE("setresuid (%u)", ctx->to.uid);
         exit(EXIT_FAILURE);
     }
 
@@ -349,7 +355,7 @@ static void allow(const struct su_context *ctx)
     ctx->to.argv[--argc] = arg0;
     execv(ctx->to.shell, ctx->to.argv + argc);
     err = errno;
-    ALOGE("exec");
+    PLOGE("exec");
     fprintf(stderr, "Cannot execute %s: %s\n", ctx->to.shell, strerror(err));
     exit(EXIT_FAILURE);
 }
@@ -487,16 +493,18 @@ int main(int argc, char *argv[])
             deny(&ctx);
         }
 
-        // enforce persist.sys.root_access on non-eng builds
+        // enforce persist.sys.root_access on non-eng builds for apps
         if (strcmp("eng", build_type) != 0 &&
-               (atoi(enabled) & 1) != 1 ) {
-            ALOGE("Root access is disabled by system setting - enable it under settings -> developer options");
+                ctx.from.uid != AID_SHELL && ctx.from.uid != AID_ROOT &&
+                (atoi(enabled) & CM_ROOT_ACCESS_APPS_ONLY) != CM_ROOT_ACCESS_APPS_ONLY ) {
+            ALOGE("Apps root access is disabled by system setting - enable it under settings -> developer options");
             deny(&ctx);
         }
 
         // disallow su in a shell if appropriate
-        if (ctx.from.uid == AID_SHELL && (atoi(enabled) == 1)) {
-            ALOGE("Root access is disabled by a system setting - enable it under settings -> developer options");
+        if (ctx.from.uid == AID_SHELL &&
+                (atoi(enabled) & CM_ROOT_ACCESS_ADB_ONLY) != CM_ROOT_ACCESS_ADB_ONLY ) {
+            ALOGE("Shell root access is disabled by a system setting - enable it under settings -> developer options");
             deny(&ctx);
         }
     }
@@ -505,7 +513,7 @@ int main(int argc, char *argv[])
         allow(&ctx);
 
     if (stat(REQUESTOR_DATA_PATH, &st) < 0) {
-        ALOGE("stat");
+        PLOGE("stat");
         deny(&ctx);
     }
 
@@ -518,20 +526,20 @@ int main(int argc, char *argv[])
 
     mkdir(REQUESTOR_CACHE_PATH, 0770);
     if (chown(REQUESTOR_CACHE_PATH, st.st_uid, st.st_gid)) {
-        ALOGE("chown (%s, %ld, %ld)", REQUESTOR_CACHE_PATH, st.st_uid, st.st_gid);
+        PLOGE("chown (%s, %ld, %ld)", REQUESTOR_CACHE_PATH, st.st_uid, st.st_gid);
         deny(&ctx);
     }
 
     if (setgroups(0, NULL)) {
-        ALOGE("setgroups");
+        PLOGE("setgroups");
         deny(&ctx);
     }
     if (setegid(st.st_gid)) {
-        ALOGE("setegid (%lu)", st.st_gid);
+        PLOGE("setegid (%lu)", st.st_gid);
         deny(&ctx);
     }
     if (seteuid(st.st_uid)) {
-        ALOGE("seteuid (%lu)", st.st_uid);
+        PLOGE("seteuid (%lu)", st.st_uid);
         deny(&ctx);
     }
 
